@@ -647,7 +647,10 @@
 # if __name__ == "__main__":
 #     main()
 
+
+
 import argparse
+import hmac
 import os
 import sqlite3
 import time
@@ -656,6 +659,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify, abort
 
 
@@ -663,8 +667,19 @@ from flask import Flask, request, jsonify, abort
 # Configuration
 # ==================================================
 
-DB_FILE = "ssrf_callbacks.db"
+# Load values from the .env file in the current project directory.
+load_dotenv()
+
+DB_FILE = os.environ.get("DB_FILE", "ssrf_callbacks.db")
 CALLBACK_API_KEY = os.environ.get("CALLBACK_API_KEY", "")
+CALLBACK_BASE = os.environ.get(
+    "CALLBACK_BASE",
+    "https://ssrf-server-u23s.onrender.com"
+).rstrip("/")
+CALLBACK_API = os.environ.get(
+    "CALLBACK_API",
+    "https://ssrf-server-u23s.onrender.com/api/events"
+).rstrip("/")
 
 SSRF_PARAM_HINTS = {
     "url", "uri", "link", "href", "src", "image", "img",
@@ -714,7 +729,6 @@ def record_callback(token, remote_addr, user_agent):
 def get_callbacks(token):
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-
         rows = conn.execute(
             """
             SELECT token, received_at, remote_addr, user_agent
@@ -760,19 +774,22 @@ def callback_events(token):
 
     supplied_key = request.headers.get("X-API-Key", "")
 
-    # Constant-time comparison for the API key.
-    import hmac
-
     if not hmac.compare_digest(supplied_key, CALLBACK_API_KEY):
         abort(403)
 
     return jsonify(get_callbacks(token))
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    # Optional health endpoint; the root path "/" remains undefined.
+    return jsonify({"status": "ok"}), 200
+
+
 def run_callback_server(host, port):
     if not CALLBACK_API_KEY:
         raise SystemExit(
-            "Set CALLBACK_API_KEY before starting the callback server."
+            "Set CALLBACK_API_KEY in your environment or .env file."
         )
 
     init_db()
@@ -788,14 +805,12 @@ def run_callback_server(host, port):
 
 def is_ssrf_parameter(name):
     name = name.lower()
-
     return any(hint in name for hint in SSRF_PARAM_HINTS)
 
 
 def valid_http_url(url):
     try:
         parsed = urlparse(url)
-
         return (
             parsed.scheme in ("http", "https")
             and bool(parsed.hostname)
@@ -810,7 +825,6 @@ def valid_http_url(url):
 def poll_callback(api_url, token, api_key):
     """
     Check the callback receiver for the unique test token.
-
     Returns matching events, or an empty list on timeout.
     """
     deadline = time.monotonic() + CALLBACK_WAIT_SECONDS
@@ -823,7 +837,6 @@ def poll_callback(api_url, token, api_key):
                 timeout=TIMEOUT,
                 allow_redirects=False
             )
-
             response.raise_for_status()
             events = response.json()
 
@@ -841,7 +854,7 @@ def poll_callback(api_url, token, api_key):
 
 def test_parameter(
     target_url,
-    parameter_name,
+    parameter_index,
     callback_base,
     callback_api,
     api_key
@@ -851,89 +864,79 @@ def test_parameter(
         parsed.query, keep_blank_values=True
     )
 
-    results = []
+    if parameter_index >= len(original_params):
+        return []
 
-    for index, (name, old_value) in enumerate(original_params):
-        if not is_ssrf_parameter(name):
-            continue
+    name, old_value = original_params[parameter_index]
 
-        token = uuid.uuid4().hex
-        callback_url = (
-            callback_base.rstrip("/") + "/c/" + token
+    if not is_ssrf_parameter(name):
+        return []
+
+    token = uuid.uuid4().hex
+    callback_url = callback_base.rstrip("/") + "/c/" + token
+
+    modified_params = list(original_params)
+    modified_params[parameter_index] = (name, callback_url)
+
+    test_url = urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        urlencode(modified_params),
+        ""
+    ))
+
+    print(f"\n[*] Testing parameter: {name}")
+    print(f"[*] Unique token: {token}")
+
+    try:
+        # Do not follow target redirects automatically.
+        response = requests.get(
+            test_url,
+            timeout=TIMEOUT,
+            allow_redirects=False
         )
+        print(f"[*] Target HTTP status: {response.status_code}")
 
-        modified_params = list(original_params)
-        modified_params[index] = (name, callback_url)
-
-        test_url = urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            urlencode(modified_params),
-            ""
-        ))
-
-        print(f"\n[*] Testing parameter: {name}")
-        print(f"[*] Unique token: {token}")
-
-        try:
-            # Do not follow target redirects automatically.
-            response = requests.get(
-                test_url,
-                timeout=TIMEOUT,
-                allow_redirects=False
-            )
-
-            print(f"[*] Target HTTP status: {response.status_code}")
-
-        except requests.RequestException as error:
-            print(f"[!] Target request failed: {error}")
-            results.append({
-                "parameter": name,
-                "status": "INCONCLUSIVE",
-                "reason": str(error)
-            })
-            continue
-
-        print("[*] Waiting for callback evidence...")
-
-        events = poll_callback(
-            callback_api, token, api_key
-        )
-
-        if events:
-            print("[+] MATCHING CALLBACK OBSERVED")
-
-            for event in events:
-                print("    Received at:", event["received_at"])
-                print("    Source IP:", event["remote_addr"])
-                print("    User-Agent:", event["user_agent"])
-
-            print(
-                "[!] Investigate whether the callback originated "
-                "from the target application's backend."
-            )
-
-            status = "CALLBACK_OBSERVED"
-        else:
-            print("[-] No matching callback observed.")
-            print(
-                "[!] This does not rule out SSRF. The request "
-                "may have been blocked, delayed, or failed."
-            )
-
-            status = "INCONCLUSIVE"
-
-        results.append({
+    except requests.RequestException as error:
+        print(f"[!] Target request failed: {error}")
+        return [{
             "parameter": name,
-            "token": token,
-            "target_url": target_url,
-            "status": status,
-            "callback_events": events
-        })
+            "status": "INCONCLUSIVE",
+            "reason": str(error)
+        }]
 
-    return results
+    print("[*] Waiting for callback evidence...")
+    events = poll_callback(callback_api, token, api_key)
+
+    if events:
+        print("[+] MATCHING CALLBACK OBSERVED")
+        for event in events:
+            print("    Received at:", event.get("received_at"))
+            print("    Source IP:", event.get("remote_addr"))
+            print("    User-Agent:", event.get("user_agent"))
+
+        print(
+            "[!] Investigate whether the callback originated "
+            "from the target application's backend."
+        )
+        status = "CALLBACK_OBSERVED"
+    else:
+        print("[-] No matching callback observed.")
+        print(
+            "[!] This does not rule out SSRF. The request may have "
+            "been blocked, delayed, or failed."
+        )
+        status = "INCONCLUSIVE"
+
+    return [{
+        "parameter": name,
+        "token": token,
+        "target_url": target_url,
+        "status": status,
+        "callback_events": events
+    }]
 
 
 def run_scan(target, callback_base, callback_api, api_key):
@@ -966,7 +969,7 @@ def run_scan(target, callback_base, callback_api, api_key):
     )
 
     candidates = [
-        name for name, value in params
+        index for index, (name, value) in enumerate(params)
         if is_ssrf_parameter(name)
     ]
 
@@ -981,32 +984,19 @@ def run_scan(target, callback_base, callback_api, api_key):
         )
         return
 
-    results = test_parameter(
-        target,
-        candidates[0],
-        callback_base,
-        callback_api,
-        api_key
-    )
-
-    # Test remaining candidate parameters individually.
-    for name in candidates[1:]:
+    results = []
+    for parameter_index in candidates:
         results.extend(test_parameter(
             target,
-            name,
+            parameter_index,
             callback_base,
             callback_api,
             api_key
         ))
 
     print("\n========== SUMMARY ==========")
-
     for result in results:
-        print(
-            result["parameter"],
-            "=>",
-            result["status"]
-        )
+        print(result["parameter"], "=>", result["status"])
 
     print(
         "\nA callback is evidence of server-side fetching only "
@@ -1023,7 +1013,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="Authorized SSRF callback verification"
     )
-
     subparsers = parser.add_subparsers(
         dest="mode", required=True
     )
@@ -1035,10 +1024,12 @@ def main():
     scan_parser = subparsers.add_parser("scan")
     scan_parser.add_argument("target")
     scan_parser.add_argument(
-        "--callback-base", required=True
+        "--callback-base",
+        default=CALLBACK_BASE
     )
     scan_parser.add_argument(
-        "--callback-api", required=True
+        "--callback-api",
+        default=CALLBACK_API
     )
 
     args = parser.parse_args()
@@ -1049,7 +1040,7 @@ def main():
     elif args.mode == "scan":
         if not CALLBACK_API_KEY:
             raise SystemExit(
-                "Set CALLBACK_API_KEY before running the scanner."
+                "Set CALLBACK_API_KEY in your .env file or environment."
             )
 
         run_scan(
