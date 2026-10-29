@@ -2,4 +2,4 @@
 Flask
 requests
 gunicorn
-beautifulsoup4
+python-dotenv
